@@ -191,7 +191,7 @@ func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
 			}
 			// filter by prefix
 			if strings.HasPrefix(key, conf.prefix) {
-				result[key] = []byte(valueStr)
+				result[strings.Trim(strings.TrimPrefix(key, conf.prefix), "/")] = []byte(valueStr)
 			}
 		}
 
