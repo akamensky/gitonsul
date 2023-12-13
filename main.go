@@ -234,7 +234,7 @@ func consulSetKV(conf *consulConfig, kvData map[string][]byte) error {
 
 			if localErr := consulDcSetKv(dc, conf, kvData, closeCh); localErr != nil {
 				close(closeCh)
-				err = localErr
+				err = fmt.Errorf("error processing datacenter '%s': %w", dc, localErr)
 			}
 		}(datacenter)
 	}
