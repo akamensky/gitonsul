@@ -114,7 +114,13 @@ func main() {
 		addr:        *consulAddrArg,
 		token:       *consulTokenArg,
 		prefix:      strings.Trim(*consulPrefixArg, "/"),
-		datacenters: strings.Split(*consulDatacentersArg, ","),
+		datacenters: make([]string, 0),
+	}
+	if len(*consulDatacentersArg) > 0 {
+		consulConf.datacenters = strings.Split(*consulDatacentersArg, ",")
+		for i, datacenter := range consulConf.datacenters {
+			consulConf.datacenters[i] = strings.TrimSpace(datacenter)
+		}
 	}
 
 	if err := consulVerifyDCs(consulConf); err != nil {
