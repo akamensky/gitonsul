@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,9 +29,10 @@ type gitConfig struct {
 }
 
 type consulConfig struct {
-	addr   string
-	token  string
-	prefix string
+	addr        string
+	token       string
+	prefix      string
+	datacenters []string
 }
 
 func main() {
@@ -89,6 +91,12 @@ func main() {
 		Default:  "",
 	})
 
+	consulDatacentersArg := p.String("", "consul-datacenters", &argparse.Options{
+		Required: false,
+		Help:     "A comma-delimited list of Consul datacenters to sync data to. By default it will sync to all datacenters",
+		Default:  "",
+	})
+
 	if err := p.Parse(os.Args); err != nil {
 		exitWithError(err)
 	}
@@ -103,9 +111,14 @@ func main() {
 		prefix:    strings.Trim(*gitPrefixArg, "/"),
 	}
 	consulConf := &consulConfig{
-		addr:   *consulAddrArg,
-		token:  *consulTokenArg,
-		prefix: strings.Trim(*consulPrefixArg, "/"),
+		addr:        *consulAddrArg,
+		token:       *consulTokenArg,
+		prefix:      strings.Trim(*consulPrefixArg, "/"),
+		datacenters: strings.Split(*consulDatacentersArg, ","),
+	}
+
+	if err := consulVerifyDCs(consulConf); err != nil {
+		exitWithError(err)
 	}
 
 	t := time.NewTicker(interval)
@@ -205,9 +218,34 @@ func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
 }
 
 func consulSetKV(conf *consulConfig, kvData map[string][]byte) error {
+	wg := &sync.WaitGroup{}
+	closeCh := make(chan interface{})
+	var err error
+	for _, datacenter := range conf.datacenters {
+		wg.Add(1)
+		go func(dc string) {
+			defer wg.Done()
+
+			if localErr := consulDcSetKv(dc, conf, kvData, closeCh); localErr != nil {
+				close(closeCh)
+				err = localErr
+			}
+		}(datacenter)
+	}
+	wg.Wait()
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func consulDcSetKv(datacenter string, conf *consulConfig, kvData map[string][]byte, closeCh <-chan interface{}) error {
 	client, err := api.NewClient(&api.Config{
-		Address: conf.addr,
-		Token:   conf.token,
+		Address:    conf.addr,
+		Token:      conf.token,
+		Datacenter: datacenter,
 	})
 	if err != nil {
 		return err
@@ -220,37 +258,80 @@ func consulSetKV(conf *consulConfig, kvData map[string][]byte) error {
 	}
 	for _, key := range keys {
 		if _, ok := kvData[key]; !ok {
-			if _, err = client.KV().Delete(key, nil); err != nil {
-				return err
+			select {
+			case <-closeCh:
+				return nil
+			default:
+				if _, err = client.KV().Delete(key, nil); err != nil {
+					return err
+				}
 			}
 		}
 	}
 
 	// Put keys into KV
 	for key, value := range kvData {
-		kvPair, _, err := client.KV().Get(key, nil)
-		if err != nil {
-			return err
+		select {
+		case <-closeCh:
+			return nil
+		default:
+			kvPair, _, err := client.KV().Get(key, nil)
+			if err != nil {
+				return err
+			}
+
+			if kvPair != nil && reflect.DeepEqual(kvPair.Value, value) {
+				continue
+			}
+
+			pair := &api.KVPair{
+				Key:   key,
+				Value: value,
+			}
+			wo := &api.WriteOptions{
+				Datacenter: datacenter,
+			}
+
+			_, err = client.KV().Put(pair, wo)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// consulVerifyDCs will compare configuration to check if all provided DCs exists
+// if no provided DCs then it will fill configuration with all existing Consul DCs
+func consulVerifyDCs(conf *consulConfig) error {
+	client, err := api.NewClient(&api.Config{
+		Address: conf.addr,
+		Token:   conf.token,
+	})
+	if err != nil {
+		return err
+	}
+
+	consulDcList, err := client.Catalog().Datacenters()
+	if err != nil {
+		return err
+	}
+	if len(conf.datacenters) > 0 {
+		// If we have any data in conf.datacenters,
+		// then we compare and filter that
+		consulDcMap := make(map[string]bool)
+		for _, dc := range consulDcList {
+			consulDcMap[dc] = true
 		}
 
-		if kvPair != nil && reflect.DeepEqual(kvPair.Value, value) {
-			continue
+		for _, confDc := range conf.datacenters {
+			if _, ok := consulDcMap[confDc]; !ok {
+				return fmt.Errorf("configured Consul Datacenter '%s' does not exist; found %v", confDc, consulDcList)
+			}
 		}
-
-		_, err = client.KV().Put(&api.KVPair{
-			Key:         key,
-			CreateIndex: 0,
-			ModifyIndex: 0,
-			LockIndex:   0,
-			Flags:       0,
-			Value:       value,
-			Session:     "",
-			Namespace:   "",
-			Partition:   "",
-		}, nil)
-		if err != nil {
-			return err
-		}
+	} else {
+		conf.datacenters = consulDcList
 	}
 
 	return nil
