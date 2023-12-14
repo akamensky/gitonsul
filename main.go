@@ -98,7 +98,8 @@ func main() {
 	})
 
 	if err := p.Parse(os.Args); err != nil {
-		exitWithError(err)
+		slog.Error(err.Error())
+		os.Exit(1)
 	}
 
 	interval := time.Duration(*intervalArg) * time.Second
@@ -124,15 +125,20 @@ func main() {
 	}
 
 	if err := consulVerifyDCs(consulConf); err != nil {
-		exitWithError(err)
+		slog.Error("error verifying Consul Datacenters", slog.Any("error", err))
+		os.Exit(1)
 	}
+
+	slog.Info("consul setup", slog.Any("datacenters", consulConf.datacenters), slog.String("address", consulConf.addr), slog.String("prefix", consulConf.prefix))
+	slog.Info("starting update loop", slog.Duration("interval", interval))
 
 	t := time.NewTicker(interval)
 	for range t.C {
 		// Get KV data as a map from Git repo
 		kvData, err := repoGetKV(gitConf)
 		if err != nil {
-			exitWithError(err)
+			slog.Error("error getting KV data from repository", slog.Any("error", err))
+			continue
 		}
 		// prepend prefix if any needed
 		if consulConf.prefix != "" {
@@ -144,14 +150,10 @@ func main() {
 		}
 		// Iterate over the map
 		if err = consulSetKV(consulConf, kvData); err != nil {
-			exitWithError(err)
+			slog.Error("error updating Consul KV data", slog.Any("error", err))
+			continue
 		}
 	}
-}
-
-func exitWithError(err error) {
-	slog.Error(err.Error())
-	os.Exit(1)
 }
 
 func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
@@ -186,7 +188,7 @@ func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
 	storage := memory.NewStorage()
 	repo, err := git.Clone(storage, nil, opts)
 	if err != nil {
-		exitWithError(err)
+		return nil, err
 	}
 
 	head, err := repo.Head()
@@ -271,6 +273,7 @@ func consulDcSetKv(datacenter string, conf *consulConfig, kvData map[string][]by
 				if _, err = client.KV().Delete(key, nil); err != nil {
 					return err
 				}
+				slog.Info("key deleted", slog.String("key", key), slog.String("datacenter", datacenter))
 			}
 		}
 	}
@@ -302,6 +305,7 @@ func consulDcSetKv(datacenter string, conf *consulConfig, kvData map[string][]by
 			if err != nil {
 				return err
 			}
+			slog.Info("key created", slog.String("key", key), slog.String("datacenter", datacenter))
 		}
 	}
 
