@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,9 +29,10 @@ type gitConfig struct {
 }
 
 type consulConfig struct {
-	addr   string
-	token  string
-	prefix string
+	addr        string
+	token       string
+	prefix      string
+	datacenters []string
 }
 
 func main() {
@@ -39,7 +41,7 @@ func main() {
 	intervalArg := p.Int("i", "interval", &argparse.Options{
 		Required: false,
 		Help:     "Interval in seconds to check updates in Bitbucket",
-		Default:  60,
+		Default:  5,
 	})
 
 	gitRepoArg := p.String("", "git-repo", &argparse.Options{
@@ -89,8 +91,15 @@ func main() {
 		Default:  "",
 	})
 
+	consulDatacentersArg := p.String("", "consul-datacenters", &argparse.Options{
+		Required: false,
+		Help:     "A comma-delimited list of Consul datacenters to sync data to. By default it will sync to all datacenters",
+		Default:  "",
+	})
+
 	if err := p.Parse(os.Args); err != nil {
-		exitWithError(err)
+		slog.Error(err.Error())
+		os.Exit(1)
 	}
 
 	interval := time.Duration(*intervalArg) * time.Second
@@ -103,36 +112,59 @@ func main() {
 		prefix:    strings.Trim(*gitPrefixArg, "/"),
 	}
 	consulConf := &consulConfig{
-		addr:   *consulAddrArg,
-		token:  *consulTokenArg,
-		prefix: strings.Trim(*consulPrefixArg, "/"),
+		addr:        *consulAddrArg,
+		token:       *consulTokenArg,
+		prefix:      strings.Trim(*consulPrefixArg, "/"),
+		datacenters: make([]string, 0),
+	}
+	if len(*consulDatacentersArg) > 0 {
+		consulConf.datacenters = strings.Split(*consulDatacentersArg, ",")
+		for i, datacenter := range consulConf.datacenters {
+			consulConf.datacenters[i] = strings.TrimSpace(datacenter)
+		}
 	}
 
+	if err := consulVerifyDCs(consulConf); err != nil {
+		slog.Error("error verifying Consul Datacenters", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	slog.Info("consul config", slog.Any("datacenters", consulConf.datacenters), slog.String("address", consulConf.addr), slog.String("prefix", consulConf.prefix))
+	slog.Info("git config", slog.String("repo", gitConf.repo), slog.String("prefix", gitConf.prefix))
+	slog.Info("starting update loop", slog.Duration("interval", interval))
+
+	loop(gitConf, consulConf)
 	t := time.NewTicker(interval)
 	for range t.C {
-		// Get KV data as a map from Git repo
-		kvData, err := repoGetKV(gitConf)
-		if err != nil {
-			exitWithError(err)
-		}
-		// prepend prefix if any needed
-		if consulConf.prefix != "" {
-			for key, value := range kvData {
-				delete(kvData, key)
-				key = fmt.Sprintf("%s/%s", consulConf.prefix, key)
-				kvData[key] = value
-			}
-		}
-		// Iterate over the map
-		if err = consulSetKV(consulConf, kvData); err != nil {
-			exitWithError(err)
-		}
+		loop(gitConf, consulConf)
 	}
 }
 
-func exitWithError(err error) {
-	slog.Error(err.Error())
-	os.Exit(1)
+func loop(gitConf *gitConfig, consulConf *consulConfig) {
+	// Get KV data as a map from Git repo
+	rawKvData, err := repoGetKV(gitConf)
+	if err != nil {
+		slog.Error("error getting KV data from repository", slog.Any("error", err))
+		return
+	}
+
+	kvData := make(map[string][]byte, len(rawKvData))
+
+	// prepend prefix if any needed
+	for rawKey, rawValue := range rawKvData {
+		value := rawValue
+		key := rawKey
+		if consulConf.prefix != "" {
+			key = fmt.Sprintf("%s/%s", consulConf.prefix, key)
+		}
+		kvData[key] = value
+	}
+
+	// Iterate over the map
+	if err = consulUpdateKV(consulConf, kvData); err != nil {
+		slog.Error("error updating Consul KV data", slog.Any("error", err))
+		return
+	}
 }
 
 func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
@@ -167,7 +199,7 @@ func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
 	storage := memory.NewStorage()
 	repo, err := git.Clone(storage, nil, opts)
 	if err != nil {
-		exitWithError(err)
+		return nil, err
 	}
 
 	head, err := repo.Head()
@@ -204,7 +236,89 @@ func repoGetKV(conf *gitConfig) (map[string][]byte, error) {
 	return result, nil
 }
 
-func consulSetKV(conf *consulConfig, kvData map[string][]byte) error {
+func consulUpdateKV(conf *consulConfig, kvData map[string][]byte) error {
+	wg := &sync.WaitGroup{}
+	closeCh := make(chan interface{})
+	var err error
+	for _, datacenter := range conf.datacenters {
+		wg.Add(1)
+		go func(dc string) {
+			defer wg.Done()
+
+			if localErr := consulDcUpdateKv(dc, conf, kvData, closeCh); localErr != nil {
+				close(closeCh)
+				err = fmt.Errorf("error processing datacenter '%s': %w", dc, localErr)
+			}
+		}(datacenter)
+	}
+	wg.Wait()
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func consulDcUpdateKv(datacenter string, conf *consulConfig, kvData map[string][]byte, closeCh <-chan interface{}) error {
+	client, err := api.NewClient(&api.Config{
+		Address:    conf.addr,
+		Token:      conf.token,
+		Datacenter: datacenter,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Delete all keys that should not exist
+	consulKV, _, err := client.KV().List(conf.prefix, nil)
+	if err != nil {
+		return err
+	}
+	consulKvMap := make(map[string][]byte, len(consulKV))
+	for _, pair := range consulKV {
+		consulKvMap[pair.Key] = pair.Value
+	}
+
+	for _, pair := range consulKV {
+		if _, ok := kvData[pair.Key]; !ok {
+			select {
+			case <-closeCh:
+				return nil
+			default:
+				if _, err = client.KV().Delete(pair.Key, nil); err != nil {
+					return err
+				}
+				slog.Info("key deleted", slog.String("key", pair.Key), slog.String("datacenter", datacenter))
+			}
+		}
+	}
+
+	// Put keys into KV
+	for key, value := range kvData {
+		select {
+		case <-closeCh:
+			return nil
+		default:
+			consulValue, ok := consulKvMap[key]
+			if ok && reflect.DeepEqual(value, consulValue) {
+				continue
+			}
+
+			_, err = client.KV().Put(&api.KVPair{Key: key, Value: value}, nil)
+			if err != nil {
+				return err
+			}
+			slog.Info("key created", slog.String("key", key), slog.String("datacenter", datacenter))
+		}
+	}
+
+	return nil
+}
+
+// consulVerifyDCs will compare configuration to check if all provided DCs exists
+// if no provided DCs then it will fill configuration with all existing Consul DCs
+func consulVerifyDCs(conf *consulConfig) error {
 	client, err := api.NewClient(&api.Config{
 		Address: conf.addr,
 		Token:   conf.token,
@@ -213,44 +327,25 @@ func consulSetKV(conf *consulConfig, kvData map[string][]byte) error {
 		return err
 	}
 
-	// Delete all keys that should not exist
-	keys, _, err := client.KV().Keys(conf.prefix, "", nil)
+	consulDcList, err := client.Catalog().Datacenters()
 	if err != nil {
 		return err
 	}
-	for _, key := range keys {
-		if _, ok := kvData[key]; !ok {
-			if _, err = client.KV().Delete(key, nil); err != nil {
-				return err
+	if len(conf.datacenters) > 0 {
+		// If we have any data in conf.datacenters,
+		// then we compare and filter that
+		consulDcMap := make(map[string]bool)
+		for _, dc := range consulDcList {
+			consulDcMap[dc] = true
+		}
+
+		for _, confDc := range conf.datacenters {
+			if _, ok := consulDcMap[confDc]; !ok {
+				return fmt.Errorf("configured Consul Datacenter '%s' does not exist; found %v", confDc, consulDcList)
 			}
 		}
-	}
-
-	// Put keys into KV
-	for key, value := range kvData {
-		kvPair, _, err := client.KV().Get(key, nil)
-		if err != nil {
-			return err
-		}
-
-		if kvPair != nil && reflect.DeepEqual(kvPair.Value, value) {
-			continue
-		}
-
-		_, err = client.KV().Put(&api.KVPair{
-			Key:         key,
-			CreateIndex: 0,
-			ModifyIndex: 0,
-			LockIndex:   0,
-			Flags:       0,
-			Value:       value,
-			Session:     "",
-			Namespace:   "",
-			Partition:   "",
-		}, nil)
-		if err != nil {
-			return err
-		}
+	} else {
+		conf.datacenters = consulDcList
 	}
 
 	return nil
