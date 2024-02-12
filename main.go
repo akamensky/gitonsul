@@ -11,7 +11,6 @@ import (
 	"github.com/hashicorp/consul/api"
 	"log/slog"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -301,7 +300,7 @@ func consulDcUpdateKv(datacenter string, conf *consulConfig, kvData map[string][
 			return nil
 		default:
 			consulValue, ok := consulKvMap[key]
-			if ok && reflect.DeepEqual(value, consulValue) {
+			if ok && string(value) == string(consulValue) {
 				continue
 			}
 
