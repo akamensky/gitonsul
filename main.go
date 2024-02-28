@@ -108,7 +108,10 @@ func main() {
 		authBasic: *gitAuthBasicArg,
 		authToken: *gitAuthTokenArg,
 		authKey:   *gitAuthKeyArg,
-		prefix:    strings.Trim(*gitPrefixArg, "/"),
+		prefix:    "",
+	}
+	if *gitPrefixArg != "" {
+		gitConf.prefix = strings.Trim(*gitPrefixArg, "/") + "/"
 	}
 	consulConf := &consulConfig{
 		addr:        *consulAddrArg,
